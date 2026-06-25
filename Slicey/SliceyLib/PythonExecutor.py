@@ -1,5 +1,6 @@
 import atexit
 import base64
+import collections
 import contextlib
 import io
 import json
@@ -17,6 +18,79 @@ import slicer
 
 logger = logging.getLogger(__name__)
 
+# Boundary markers (character offsets into the console's text) recorded each time the user
+# sends a new chat message - see markNewPrompt()/getPythonConsoleOutput().
+_promptMarkers = collections.deque(maxlen=10)
+
+
+def markNewPrompt():
+    """Records a boundary at the console's current length, called once per user-sent chat
+    message (SliceyLogic.sendUserMessage) so getPythonConsoleOutput() can scope its results to
+    specific prompts."""
+    text = _getConsoleText()
+    if text is not None:
+        _promptMarkers.append(len(text))
+
+
+def _getConsoleText():
+    """Returns the full text currently displayed in Slicer's Python console
+    (slicer.app.pythonConsole()), or None if it can't be found. ctkPythonConsole has no public
+    method to read back its displayed text - the text actually lives in its private QTextEdit-
+    based implementation widget, so this reaches in via findChildren for the first child that
+    responds to toPlainText(). Must be called from the main thread."""
+    console = slicer.app.pythonConsole()
+    if console is None:
+        return None
+    for child in console.findChildren("QWidget"):
+        if hasattr(child, "toPlainText"):
+            return child.toPlainText()
+    return None
+
+
+def getPythonConsoleOutput(historyIndex=0, offset=0, length=None):
+    """Returns text printed to Slicer's Python console - including output from things other
+    than the caller's own code, e.g. the user manually interacting with the GUI - scoped to a
+    window between two chat-message boundaries. historyIndex=0 (default) is everything since
+    the user's most recent chat message; 1 is the window one chat message before that; 2 two
+    messages before that, etc. Up to 10 boundaries are kept. offset/length page through a long
+    result (character-based, like Python slicing).
+    """
+    text = _getConsoleText()
+    if text is None:
+        return {"error": "Could not access Slicer's Python console widget."}
+
+    maxHistoryIndex = len(_promptMarkers)
+    if historyIndex < 0 or historyIndex > maxHistoryIndex:
+        return {
+            "error": (
+                f"history_index must be between 0 and {maxHistoryIndex} "
+                f"({maxHistoryIndex} prior chat message boundary/boundaries are known)."
+            )
+        }
+
+    currentLength = len(text)
+    if historyIndex == 0:
+        start = _promptMarkers[-1] if _promptMarkers else 0
+        end = currentLength
+    else:
+        end = _promptMarkers[-historyIndex]
+        start = _promptMarkers[-historyIndex - 1] if historyIndex < maxHistoryIndex else 0
+
+    start = max(0, min(start, currentLength))
+    end = max(0, min(end, currentLength))
+    segment = text[start:end]
+
+    offset = max(0, offset)
+    sliced = segment[offset:] if length is None else segment[offset:offset + max(0, length)]
+
+    return {
+        "text": sliced,
+        "segmentLength": len(segment),
+        "returnedLength": len(sliced),
+        "historyIndex": historyIndex,
+        "maxHistoryIndex": maxHistoryIndex,
+    }
+
 
 def executeInProcess(code):
     """Executes `code` directly inside this already-running Slicer process. Must be called
@@ -26,7 +100,10 @@ def executeInProcess(code):
     import qt
     import vtk
 
-    execGlobals = {"slicer": slicer, "vtk": vtk, "qt": qt, "ctk": ctk}
+    execGlobals = {
+        "slicer": slicer, "vtk": vtk, "qt": qt, "ctk": ctk,
+        "getPythonConsoleOutput": getPythonConsoleOutput,
+    }
     try:
         import numpy
         execGlobals["numpy"] = numpy

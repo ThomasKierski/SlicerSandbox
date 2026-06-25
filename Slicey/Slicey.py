@@ -1,6 +1,8 @@
+import datetime
 import html
 import json
 import logging
+import os
 import queue
 import threading
 
@@ -54,6 +56,60 @@ def _contentBlockToDict(block):
     return {"type": blockType}
 
 
+def _cancelledToolResults(toolBlocks):
+    """Builds tool_result content blocks for tool_use blocks that are being skipped because
+    the user clicked Stop, so the assistant message that contains them always gets a matching
+    tool_result (Anthropic rejects any history where it doesn't)."""
+    return [
+        {
+            "type": "tool_result",
+            "tool_use_id": block["id"],
+            "content": json.dumps({"error": "Cancelled by the user before this tool call ran."}),
+            "is_error": True,
+        }
+        for block in toolBlocks
+    ]
+
+
+def _renderMarkdownTranscript(messages):
+    """Renders the Anthropic message list (the same structures sent to/from the API) as a
+    readable Markdown chat log, including tool calls and their results."""
+    lines = []
+    toolNames = {}
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "user" and isinstance(content, str):
+            lines.append("## You\n")
+            lines.append(f"{content}\n")
+
+        elif role == "assistant" and isinstance(content, list):
+            textParts = [b["text"] for b in content if b.get("type") == "text"]
+            if textParts:
+                lines.append("## Slicey\n")
+                lines.append("\n".join(textParts) + "\n")
+            for block in content:
+                if block.get("type") == "tool_use":
+                    toolNames[block["id"]] = block["name"]
+                    lines.append(f"### Tool call: {block['name']}\n")
+                    lines.append("```json")
+                    lines.append(json.dumps(block.get("input", {}), indent=2))
+                    lines.append("```\n")
+
+        elif role == "user" and isinstance(content, list):
+            for block in content:
+                if block.get("type") == "tool_result":
+                    name = toolNames.get(block.get("tool_use_id"), "tool")
+                    label = "Rejected" if block.get("is_error") else "Result"
+                    lines.append(f"**{label} of {name}:**\n")
+                    lines.append("```json")
+                    lines.append(str(block.get("content", "")))
+                    lines.append("```\n")
+
+    return "\n".join(lines)
+
+
 #
 # Slicey
 #
@@ -100,6 +156,8 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         ScriptedLoadableModuleLogic.__init__(self)
         self.messages = []
+        self.chatLogPath = None
+        self._chatStartedAt = None
         self.onEvent = None
         self.confirmCallback = None
 
@@ -139,6 +197,40 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
 
     def resetConversation(self):
         self.messages = []
+        # A new chat gets a new log file, named from the timestamp of its first message.
+        self.chatLogPath = None
+
+    def _appendMessage(self, message):
+        """The single place messages are added to the conversation, so the on-disk chat log
+        (Settings.getChatLogFolder()/Slicey-<timestamp>.md) is always kept in sync - updated
+        immediately on every user message, assistant reply, and tool call/result, not just
+        when a chat starts or ends."""
+        self.messages.append(message)
+        self._ensureChatLogPath()
+        self._writeChatLog()
+
+    def _ensureChatLogPath(self):
+        if self.chatLogPath:
+            return
+        folder = Settings.getChatLogFolder()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Slicey: could not create chat log folder {folder}: {e}")
+            return
+        now = datetime.datetime.now()
+        self._chatStartedAt = now
+        self.chatLogPath = os.path.join(folder, f"Slicey-{now.strftime('%Y%m%d-%H%M%S')}.md")
+
+    def _writeChatLog(self):
+        if not self.chatLogPath:
+            return
+        title = f"# Slicey chat - {self._chatStartedAt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        try:
+            with open(self.chatLogPath, "w", encoding="utf-8") as f:
+                f.write(title + "\n" + _renderMarkdownTranscript(self.messages))
+        except OSError as e:
+            logger.warning(f"Slicey: could not write chat log to {self.chatLogPath}: {e}")
 
     def resetSessionUsage(self):
         self.sessionInputTokens = 0
@@ -206,13 +298,15 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
     def sendUserMessage(self, text):
         if self._busy:
             return
-        self.messages.append({"role": "user", "content": text})
+        PythonExecutor.markNewPrompt()
+        self._appendMessage({"role": "user", "content": text})
         self._cancelRequested = False
         self._busy = True
         self._emit("turn_started", None)
         self._startClaudeTurn()
 
     def _startClaudeTurn(self):
+        self._repairDanglingToolUse()
         try:
             client = self.getClient()
             model = Settings.getModel()
@@ -233,6 +327,33 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
         threading.Thread(target=worker, daemon=True).start()
         if not self._pollTimer.isActive():
             self._pollTimer.start()
+
+    def _repairDanglingToolUse(self):
+        """Defensive self-heal: if the conversation history ends with an assistant message
+        containing tool_use blocks with no matching tool_result - a bug, or a turn that got
+        interrupted in a previous session - every future request 400s on that history
+        forever. Patch it up automatically instead of leaving the conversation permanently
+        stuck (the user would otherwise have to notice and click Clear chat)."""
+        if not self.messages:
+            return
+        last = self.messages[-1]
+        if last.get("role") != "assistant" or not isinstance(last.get("content"), list):
+            return
+        toolBlocks = [b for b in last["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not toolBlocks:
+            return
+        self._appendMessage({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block["id"],
+                    "content": json.dumps({"error": "No result was recorded for this tool call; treat it as failed."}),
+                    "is_error": True,
+                }
+                for block in toolBlocks
+            ],
+        })
 
     def _finishTurn(self):
         self._busy = False
@@ -263,14 +384,23 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
         self._recordUsage(response, model)
 
         blocks = [_contentBlockToDict(b) for b in response.content]
-        self.messages.append({"role": "assistant", "content": blocks})
+        self._appendMessage({"role": "assistant", "content": blocks})
 
         textParts = [b["text"] for b in blocks if b["type"] == "text"]
         if textParts:
             self._emit("assistant_text", "\n".join(textParts))
 
         toolBlocks = [b for b in blocks if b["type"] == "tool_use"]
-        if not toolBlocks or self._cancelRequested:
+        if not toolBlocks:
+            self._finishTurn()
+            return
+
+        if self._cancelRequested:
+            # The assistant message with these tool_use blocks is already in self.messages
+            # (appended above). Anthropic requires a matching tool_result for every tool_use
+            # in the *next* message no matter what, even though we're not going to run these
+            # or continue the loop - otherwise every future request 400s on this history.
+            self._appendMessage({"role": "user", "content": _cancelledToolResults(toolBlocks)})
             self._finishTurn()
             return
 
@@ -341,9 +471,10 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
         threading.Thread(target=worker, daemon=True).start()
 
     def _finishToolBatch(self):
-        if self._cancelRequested:
-            self._finishTurn()
-            return
+        # Always append a tool_result for every pending block first - the assistant message
+        # with these tool_use blocks is already in self.messages, so Anthropic requires a
+        # matching tool_result regardless of whether we're about to stop here (cancelled) or
+        # continue the loop.
         content = [
             {
                 "type": "tool_result",
@@ -352,7 +483,11 @@ class SliceyLogic(ScriptedLoadableModuleLogic):
             }
             for block in self._pendingBlocks
         ]
-        self.messages.append({"role": "user", "content": content})
+        self._appendMessage({"role": "user", "content": content})
+
+        if self._cancelRequested:
+            self._finishTurn()
+            return
         self._startClaudeTurn()
 
     def _emit(self, eventType, payload):
@@ -568,8 +703,14 @@ class SliceyWidget(ScriptedLoadableModuleWidget):
         self.ui.customInstructionsTextEdit.plainText = Settings.getCustomSystemPromptText()
         self.ui.customInstructionsTextEdit.textChanged.connect(self.onCustomInstructionsChanged)
 
+        self.ui.chatLogFolderPathLineEdit.currentPath = Settings.getChatLogFolder()
+        self.ui.chatLogFolderPathLineEdit.currentPathChanged.connect(self.onChatLogFolderChanged)
+
     def onCustomInstructionsChanged(self):
         Settings.setCustomSystemPromptText(self.ui.customInstructionsTextEdit.plainText)
+
+    def onChatLogFolderChanged(self, path):
+        Settings.setChatLogFolder(path)
 
     def _refreshFoldersTable(self):
         folders = FolderAccess.listSharedFolders()
@@ -638,7 +779,7 @@ class SliceyWidget(ScriptedLoadableModuleWidget):
         self.ui.sendButton.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.ui.sendButton.clicked.connect(self.onSendClicked)
         self.ui.stopButton.clicked.connect(self.onStopClicked)
-        self.ui.clearButton.clicked.connect(self.onClearChatClicked)
+        self.ui.clearButton.clicked.connect(self.onNewChatClicked)
 
         self.ui.approveButton.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.ui.approveButton.clicked.connect(self.onApproveClicked)
@@ -666,7 +807,7 @@ class SliceyWidget(ScriptedLoadableModuleWidget):
     def onStopClicked(self):
         self.logic.cancel()
 
-    def onClearChatClicked(self):
+    def onNewChatClicked(self):
         self.logic.resetConversation()
         self.logic.resetSessionUsage()
         self.ui.chatView.clear()
@@ -709,7 +850,7 @@ class SliceyWidget(ScriptedLoadableModuleWidget):
     def _confirmToolCall(self, name, toolInput):
         if name == "run_python_in_slicer":
             detail = toolInput.get("code", "")
-            summary = f"Slicey wants to run Python code in Slicer (target={toolInput.get('target', 'current')}). Approve?"
+            summary = f"Slicey wants to run Python code in Slicer (target={Settings.getExecutionTarget()}). Approve?"
         else:
             detail = toolInput.get("content", "")
             summary = f"Slicey wants to write to this file: {toolInput.get('path', '')}. Approve?"

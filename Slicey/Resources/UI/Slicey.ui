@@ -259,6 +259,32 @@
         </layout>
        </widget>
       </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_4">
+        <property name="title">
+         <string>Chat log</string>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_5">
+         <item>
+          <widget class="QLabel" name="chatLogFolderLabel">
+           <property name="text">
+            <string>Folder each chat is saved into (as Slicey-YYYYMMDD-HHMMSS.md):</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="ctkPathLineEdit" name="chatLogFolderPathLineEdit">
+           <property name="filters">
+            <set>ctkPathLineEdit::Dirs|ctkPathLineEdit::Drives|ctkPathLineEdit::NoDot|ctkPathLineEdit::NoDotDot</set>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
@@ -399,7 +425,7 @@
      <item row="2" column="1">
       <widget class="QPushButton" name="clearButton">
        <property name="text">
-        <string>Clear chat</string>
+        <string>New chat</string>
        </property>
       </widget>
      </item>
@@ -420,6 +446,11 @@
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkPathLineEdit</class>
+   <extends>QWidget</extends>
+   <header>ctkPathLineEdit.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 import slicer
 
@@ -122,6 +123,15 @@ def getExecutionTarget():
 
 def setExecutionTarget(value):
     setString("ExecutionTarget", value)
+
+
+def getChatLogFolder():
+    """Folder each chat is saved into as Slicey-YYYYMMDD-HHMMSS.md, one file per chat."""
+    return getString("ChatLogFolder", os.path.join(os.path.expanduser("~"), ".Slicey"))
+
+
+def setChatLogFolder(value):
+    setString("ChatLogFolder", value)
 
 
 # Fixed base instructions - not user-editable. The shared-folder list itself is always

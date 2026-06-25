@@ -64,17 +64,21 @@ TOOLS = [
             "Prefer slicer.util.reloadScriptedModule('ModuleName') after editing a module rather than "
             "restarting Slicer. Set a dict on a variable named __execResult if you want structured "
             "data back in addition to stdout/stderr.\n"
-            "target='current' runs in the user's already-open Slicer window and affects their live "
-            "scene/GUI immediately.\n"
-            "target='new_instance' launches (or reuses) a separate, isolated Slicer process with no "
-            "scene loaded - safer for testing a module load/reload without touching the user's open "
-            "scene, at the cost of being slower the first time it starts up."
+            "Where this runs is fixed by the user in the Settings panel's Execution section, not by "
+            "you: either their already-open Slicer window (affects their live scene/GUI immediately), "
+            "or a separate, isolated companion Slicer process with no scene loaded.\n"
+            "When running in the user's current Slicer window, getPythonConsoleOutput(historyIndex=0, "
+            "offset=0, length=None) is also already available - it returns text recently printed to "
+            "Slicer's own Python console, including from things other than your own code (e.g. the "
+            "user manually interacting with the GUI, or other modules logging/erroring). historyIndex=0 "
+            "(default) is everything since the user's last chat message, 1 is the window one chat "
+            "message before that, 2 two messages before that, etc. (up to 10 kept); offset/length page "
+            "through a long result, character-based."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Python source code to execute."},
-                "target": {"type": "string", "enum": ["current", "new_instance"], "description": "Default 'current'."},
             },
             "required": ["code"],
         },
@@ -96,7 +100,21 @@ def buildSystemPrompt():
     else:
         folderLines = "  (none configured yet - ask the user to add one in the Settings panel if you need file access)"
 
-    prompt = f"{Settings.SYSTEM_PROMPT_INSTRUCTIONS}\n\nShared folders you currently have access to:\n{folderLines}"
+    if Settings.getExecutionTarget() == "new_instance":
+        executionNote = (
+            "run_python_in_slicer currently runs in a separate, isolated companion Slicer "
+            "process with no scene loaded - it will NOT affect the user's open scene/GUI."
+        )
+    else:
+        executionNote = (
+            "run_python_in_slicer currently runs in the user's already-open Slicer window - it "
+            "affects their live scene/GUI immediately."
+        )
+
+    prompt = (
+        f"{Settings.SYSTEM_PROMPT_INSTRUCTIONS}\n\n{executionNote}\n\n"
+        f"Shared folders you currently have access to:\n{folderLines}"
+    )
 
     customText = Settings.getCustomSystemPromptText().strip()
     if customText:
@@ -109,11 +127,31 @@ def requiresMainThread(name, toolInput):
     """Returns True if dispatching this tool call must happen on Slicer's main thread (it
     touches Slicer/Qt/VTK/MRML objects). The only tool call that's safe to run on a background
     thread is run_python_in_slicer targeting a separate companion instance, since that only
-    involves subprocess/socket/HTTP calls on our side.
+    involves subprocess/socket/HTTP calls on our side. The target is the user's Settings panel
+    choice (Settings.getExecutionTarget()), not something Claude requests per call.
     """
     if name == "run_python_in_slicer":
-        return toolInput.get("target", "current") != "new_instance"
+        return Settings.getExecutionTarget() != "new_instance"
     return True
+
+
+class _MissingToolArgument(Exception):
+    pass
+
+
+def _require(toolInput, key):
+    """Looks up a required tool argument, raising an actionable error (instead of a bare
+    KeyError) if it's missing - most often because the response got cut off by the max_tokens
+    limit partway through a large tool call (e.g. writing a big file), which can leave the
+    JSON for that argument incomplete."""
+    if key not in toolInput:
+        raise _MissingToolArgument(
+            f"Missing required '{key}' argument - the response was likely cut off by the "
+            f"max_tokens limit while generating this tool call. Try again with a smaller "
+            f"amount of content per call (e.g. write a short file first, then use "
+            f"write_text_file with mode='append' one or more times to add the rest)."
+        )
+    return toolInput[key]
 
 
 def dispatchTool(name, toolInput):
@@ -122,17 +160,19 @@ def dispatchTool(name, toolInput):
         if name == "list_shared_folders":
             return {"folders": FolderAccess.listSharedFolders()}
         if name == "list_directory":
-            return FolderAccess.listDirectory(toolInput["path"], toolInput.get("recursive", False))
+            return FolderAccess.listDirectory(_require(toolInput, "path"), toolInput.get("recursive", False))
         if name == "read_text_file":
-            return FolderAccess.readTextFile(toolInput["path"])
+            return FolderAccess.readTextFile(_require(toolInput, "path"))
         if name == "write_text_file":
-            return FolderAccess.writeTextFile(toolInput["path"], toolInput["content"], toolInput.get("mode", "overwrite"))
+            return FolderAccess.writeTextFile(_require(toolInput, "path"), _require(toolInput, "content"), toolInput.get("mode", "overwrite"))
         if name == "run_python_in_slicer":
-            target = toolInput.get("target", "current")
-            if target == "new_instance":
-                return PythonExecutor.executeInNewInstance(toolInput["code"])
-            return PythonExecutor.executeInProcess(toolInput["code"])
+            code = _require(toolInput, "code")
+            if Settings.getExecutionTarget() == "new_instance":
+                return PythonExecutor.executeInNewInstance(code)
+            return PythonExecutor.executeInProcess(code)
         return {"error": f"Unknown tool: {name}"}
+    except _MissingToolArgument as e:
+        return {"error": str(e)}
     except Exception as e:
         logger.exception("Slicey: tool execution failed")
         return {"error": str(e)}
@@ -166,7 +206,7 @@ def testApiKey(apiKey):
         return False, str(e)
 
 
-def sendMessage(client, model, messages, systemPrompt, maxTokens=4096):
+def sendMessage(client, model, messages, systemPrompt, maxTokens=16000):
     """Blocking call to the Messages API with tools enabled. Safe to call from a background
     thread - performs no Slicer/Qt access itself.
     """
