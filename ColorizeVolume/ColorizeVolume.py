@@ -582,7 +582,7 @@ class ColorizeVolumeLogic(ScriptedLoadableModuleLogic):
             numberOfItems = sequenceBrowserNode.GetNumberOfItems()
             for i in range(numberOfItems):
                 logging.info(f"Colorizing item {i+1}/{numberOfItems} of sequence")
-                ColorizeVolumeLogic._processVolume(
+                self._processVolume(
                     inputScalarVolume,
                     inputSegmentation,
                     outputRgbaVolume,
